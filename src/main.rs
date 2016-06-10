@@ -27,14 +27,14 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
 }
 
 fn run(matches: Matches) -> Result<(), Error> {
-    let tasks_filename = try!(matches.opt_str("tasks").ok_or(Error::CmdArgs(CmdArgsError::NoWordsFileProvided)));
+    let tasks_filename = try!(matches.opt_str("tasks").ok_or(Error::CmdArgs(CmdArgsError::NoTasksFileProvided)));
     let slaves_count: usize = {
         let slaves_count_str = matches.opt_str("slaves").unwrap_or("4".to_string());
         try!(slaves_count_str.parse().map_err(|e| Error::CmdArgs(CmdArgsError::InvalidSlavesValue(slaves_count_str, e))))
     };
 
     println!("Starting with tasks_filename = {}, slaves_count = {}", tasks_filename, slaves_count);
-    
+
     Ok(())
 }
 
@@ -55,4 +55,3 @@ fn main() {
         }
     }
 }
-
