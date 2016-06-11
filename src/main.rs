@@ -1,4 +1,5 @@
 extern crate getopts;
+extern crate jobsteal;
 
 use std::{io, env, process};
 use std::io::{Write, BufReader, BufRead};
@@ -6,6 +7,7 @@ use std::fs::File;
 use std::path::Path;
 use std::num::ParseIntError;
 use getopts::{Options, Matches};
+use jobsteal::{make_pool, IntoSpliterator, Spliterator};
 
 #[derive(Debug)]
 enum Error {
@@ -13,6 +15,8 @@ enum Error {
     TasksOpen(io::Error),
     TasksRead(io::Error),
     TasksParse(ParsingError),
+    JobStealPool(io::Error),
+    Solve(SolvingError),
 }
 
 #[derive(Debug)]
@@ -28,6 +32,11 @@ enum ParsingError {
     MissingTiles(String),
     BadField(String, MatrixError),
     BadTile(String, String, MatrixError),
+}
+
+#[derive(Debug)]
+enum SolvingError {
+    NoSolution(String),
 }
 
 #[derive(Debug)]
@@ -47,6 +56,7 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
 struct Matrix {
     rows: usize,
     cols: usize,
+    row_mask: u64,
     bits: u64,
 }
 
@@ -57,8 +67,22 @@ struct Tile {
 
 #[derive(Debug)]
 struct Task {
+    id: String,
     field: Matrix,
     tiles: Vec<Tile>,
+}
+
+impl Tile {
+    fn install(&self, row: usize, col: usize, mut bits: u64, cols: usize) -> u64 {
+        for j in 0 .. self.area.rows {
+            let row_offset = self.area.cols * j;
+            let mask = self.area.row_mask << row_offset;
+            let row_bits = (self.area.bits & mask) >> row_offset;
+            let clear_mask = !((row_bits << col) << ((row + j) * cols));
+            bits &= clear_mask;
+        }
+        bits
+    }
 }
 
 fn load_tasks<P>(tasks_filename: P) -> Result<Vec<Task>, Error> where P: AsRef<Path> {
@@ -70,8 +94,8 @@ fn load_tasks<P>(tasks_filename: P) -> Result<Vec<Task>, Error> where P: AsRef<P
         WaitingTask,
         WaitingField(String),
         ReadingField(String),
-        WaitingTile(String, Task),
-        ReadingTile(String, String, Task),
+        WaitingTile(Task),
+        ReadingTile(String, Task),
     }
     let mut state = State::WaitingTask;
     let mut area = Vec::new();
@@ -92,25 +116,29 @@ fn load_tasks<P>(tasks_filename: P) -> Result<Vec<Task>, Error> where P: AsRef<P
             } else {
                 let mut bits = 0;
                 let mut bit_index = 0;
+                let mut row_mask = 0;
                 for row in area.iter() {
+                    row_mask = 0;
                     for ch in row.chars() {
                         if ch == '1' {
                             bits |= 1 << bit_index;
                         }
                         bit_index += 1;
+                        row_mask = (row_mask << 1) | 1;
                     }
                 }
                 Ok(Matrix {
                     rows: rows,
                     cols: cols,
+                    row_mask: row_mask,
                     bits: bits,
                 })
             }
         } else {
             Err(MatrixError::Empty)
         }
-    }        
-    
+    }
+
     loop {
         line.clear();
         match in_stream.read_line(&mut line) {
@@ -124,7 +152,7 @@ fn load_tasks<P>(tasks_filename: P) -> Result<Vec<Task>, Error> where P: AsRef<P
                             } else if trimmed_line.starts_with("= ЗАДАЧА") {
                                 state = State::WaitingField(trimmed_line.to_owned());
                             },
-                        
+
                         State::WaitingField(task_id) =>
                             if len == 0 {
                                 return Err(Error::TasksParse(ParsingError::MissingField(task_id.clone())));
@@ -142,41 +170,42 @@ fn load_tasks<P>(tasks_filename: P) -> Result<Vec<Task>, Error> where P: AsRef<P
                             } else {
                                 let field = try!(area_to_matrix(&area).map_err(|e| Error::TasksParse(ParsingError::BadField(task_id.clone(), e))));
                                 let task = Task {
+                                    id: task_id,
                                     field: field,
                                     tiles: Vec::new(),
                                 };
-                                state = State::WaitingTile(task_id, task);
+                                state = State::WaitingTile(task);
                                 continue;
                             },
-                        
-                        State::WaitingTile(task_id, task) =>
+
+                        State::WaitingTile(task) =>
                             if len == 0 && task.tiles.is_empty() {
-                                return Err(Error::TasksParse(ParsingError::MissingTiles(task_id)));
+                                return Err(Error::TasksParse(ParsingError::MissingTiles(task.id)));
                             } else if trimmed_line.starts_with("= ЗАДАЧА") && task.tiles.is_empty() {
-                                return Err(Error::TasksParse(ParsingError::MissingTiles(task_id)));
+                                return Err(Error::TasksParse(ParsingError::MissingTiles(task.id)));
                             } else if len == 0 || trimmed_line.starts_with("= ЗАДАЧА") {
                                 tasks.push(task);
                                 state = State::WaitingTask;
                                 continue;
                             } else if trimmed_line.starts_with("Фигура") {
                                 area.clear();
-                                state = State::ReadingTile(task_id, trimmed_line.to_owned(), task);
+                                state = State::ReadingTile(trimmed_line.to_owned(), task);
                             } else {
-                                state = State::WaitingTile(task_id, task);
+                                state = State::WaitingTile(task);
                             },
-                        
-                        State::ReadingTile(task_id, tile_id, mut task) =>
+
+                        State::ReadingTile(tile_id, mut task) =>
                             if trimmed_line.len() > 0 && trimmed_line.chars().all(|c| c == '0' || c == '1') {
                                 area.push(trimmed_line.to_owned());
-                                state = State::ReadingTile(task_id, tile_id, task);
+                                state = State::ReadingTile(tile_id, task);
                             } else {
                                 let tile_area =
-                                    try!(area_to_matrix(&area).map_err(|e| Error::TasksParse(ParsingError::BadTile(task_id.clone(), tile_id, e))));
+                                    try!(area_to_matrix(&area).map_err(|e| Error::TasksParse(ParsingError::BadTile(task.id.clone(), tile_id, e))));
                                 let tile = Tile {
                                     area: tile_area,
                                 };
                                 task.tiles.push(tile);
-                                state = State::WaitingTile(task_id, task);
+                                state = State::WaitingTile(task);
                                 continue;
                             },
                     }
@@ -197,10 +226,73 @@ fn run(matches: Matches) -> Result<(), Error> {
         try!(slaves_count_str.parse().map_err(|e| Error::CmdArgs(CmdArgsError::InvalidSlavesValue(slaves_count_str, e))))
     };
 
-    println!("Starting with tasks_filename = {}, slaves_count = {}.", tasks_filename, slaves_count);
-    
     let tasks = try!(load_tasks(tasks_filename));
-    println!("Total {} tasks loaded.", tasks.len());
+    let mut pool = try!(make_pool(slaves_count).map_err(Error::JobStealPool));
+    let results: Vec<_> = tasks
+        .into_split_iter()
+        .map(|Task { id: task_id, field: task_field, tiles: task_tiles }| {
+            struct TileState {
+                tile: Tile,
+                row: usize,
+                col: usize,
+                field_bits: u64,
+            }
+
+            let mut stack: Vec<_> = task_tiles
+                .into_iter()
+                .map(|tile| TileState {
+                    tile: tile,
+                    row: 0,
+                    col: 0,
+                    field_bits: task_field.bits,
+                })
+                .collect();
+
+            let mut sp = 0;
+            loop {
+                if stack[sp].col + stack[sp].tile.area.cols > task_field.cols {
+                    stack[sp].col = 0;
+                    stack[sp].row += 1;
+                }
+                if stack[sp].row + stack[sp].tile.area.rows > task_field.rows {
+                    if sp == 0 {
+                        return Err(Error::Solve(SolvingError::NoSolution(task_id)));
+                    } else {
+                        stack[sp - 1].col += 1;
+                        sp -= 1;
+                        continue;
+                    }
+                }
+
+                let installed_bits =
+                    stack[sp].tile.install(stack[sp].row, stack[sp].col, stack[sp].field_bits, task_field.cols);
+
+                if sp + 1 < stack.len() {
+                    stack[sp + 1].row = 0;
+                    stack[sp + 1].col = 0;
+                    stack[sp + 1].field_bits = installed_bits;
+                    sp += 1;
+                } else if installed_bits == 0 {
+                    break;
+                } else {
+                    stack[sp].col += 1;
+                }
+            }
+
+            let coords: Vec<_> = stack
+                .into_iter()
+                .map(|TileState { row: r, col: c, .. }| (c, r))
+                .collect();
+            Ok(coords)
+        })
+        .collect(&pool.spawner());
+
+    for maybe_coords in results {
+        for (i, (x, y)) in try!(maybe_coords).into_iter().enumerate() {
+            print!("{}({}, {})", if i == 0 { "" } else { ", " }, x, y);
+        }
+        println!("");
+    }
 
     Ok(())
 }
